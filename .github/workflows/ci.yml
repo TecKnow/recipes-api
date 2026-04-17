@@ -54,4 +54,4 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-        run: poetry run python agent.py
+        run: poetry run python agent.py $GITHUB_TOKEN $REPOSITORY $PR_NUMBER $GROQ_API_KEY
