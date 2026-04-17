@@ -43,13 +43,11 @@ llm = OpenAI(
 repository = git.get_repo(repository_id)
 
 CONTEXT_AGENT_PROMPT = """
-You are the context gathering agent. When gathering context, you MUST gather:
-  - The details: author, title, body, diff_url, state, and head_sha.
-  - Changed files by calling get_pr_changed_files with the PR number.
-  - Any requested files.
-If asked for the PR diff, use get_pr_changed_files; do not fetch diff_url.
-Once you gather the requested info, you MUST hand control back to the
-CommentorAgent.
+You are the context gathering agent. When asked to gather PR review context,
+call get_pr_review_context with the PR number. That tool gathers PR metadata,
+the aggregate changed files, patch hunks, and CONTRIBUTING.md.
+Do not call get_pr_commit_details for pull request reviews.
+Once get_pr_review_context succeeds, hand control back to CommentorAgent.
 Never provide a user-facing final response yourself.
 """
 
@@ -118,6 +116,18 @@ class ChangedFileDetails(TypedDict):
     patch: str | None
 
 
+def changed_file_to_details(changed_file) -> ChangedFileDetails:
+    """Convert a PyGithub changed file object to a plain dict."""
+    return {
+        "filename": changed_file.filename,
+        "status": changed_file.status,
+        "additions": changed_file.additions,
+        "deletions": changed_file.deletions,
+        "changes": changed_file.changes,
+        "patch": changed_file.patch,
+    }
+
+
 def get_pr_details(pr_number: int) -> PRDetails:
     """Fetch pull request details, including metadata and commit SHAs."""
     pull_request = repository.get_pull(pr_number)
@@ -145,20 +155,16 @@ def get_pr_commit_details(head_sha: str) -> list[ChangedFileDetails]:
     Prefer get_pr_changed_files for pull request reviews. This fallback returns
     only files changed in one commit, not the full pull request.
     """
+    if script_pr_number:
+        pull_request = repository.get_pull(int(script_pr_number))
+        if pull_request.head.sha == head_sha:
+            return get_pr_changed_files(int(script_pr_number))
+
     commit = repository.get_commit(head_sha)
     changed_files = []
 
     for changed_file in commit.files:
-        changed_files.append(
-            {
-                "filename": changed_file.filename,
-                "status": changed_file.status,
-                "additions": changed_file.additions,
-                "deletions": changed_file.deletions,
-                "changes": changed_file.changes,
-                "patch": changed_file.patch,
-            }
-        )
+        changed_files.append(changed_file_to_details(changed_file))
 
     return changed_files
 
@@ -169,18 +175,54 @@ def get_pr_changed_files(pr_number: int) -> list[ChangedFileDetails]:
     changed_files = []
 
     for changed_file in pull_request.get_files():
-        changed_files.append(
-            {
-                "filename": changed_file.filename,
-                "status": changed_file.status,
-                "additions": changed_file.additions,
-                "deletions": changed_file.deletions,
-                "changes": changed_file.changes,
-                "patch": changed_file.patch,
-            }
-        )
+        changed_files.append(changed_file_to_details(changed_file))
 
     return changed_files
+
+
+def format_changed_files(changed_files: list[ChangedFileDetails]) -> str:
+    """Format changed file details compactly for the review agent state."""
+    formatted_files = []
+
+    for index, changed_file in enumerate(changed_files, start=1):
+        patch = changed_file["patch"] or "No patch available."
+        formatted_files.append(
+            "\n".join(
+                [
+                    f"{index}. {changed_file['filename']}",
+                    f"   Status: {changed_file['status']}",
+                    f"   Additions: {changed_file['additions']}",
+                    f"   Deletions: {changed_file['deletions']}",
+                    "   Patch:",
+                    patch,
+                ]
+            )
+        )
+
+    return "\n\n".join(formatted_files)
+
+
+def get_pr_review_context(pr_number: int) -> str:
+    """Fetch PR metadata, aggregate changed files, and contribution rules."""
+    pr_details = get_pr_details(pr_number)
+    changed_files = get_pr_changed_files(pr_number)
+    contribution_rules = get_file_contents("CONTRIBUTING.md")
+
+    return "\n\n".join(
+        [
+            "PR Details:",
+            f"Author: {pr_details['author']}",
+            f"Title: {pr_details['title']}",
+            f"Body: {pr_details['body']}",
+            f"State: {pr_details['state']}",
+            f"Diff URL: {pr_details['diff_url']}",
+            f"Head SHA: {pr_details['head_sha']}",
+            "Changed Files:",
+            format_changed_files(changed_files),
+            "Contribution Rules:",
+            contribution_rules,
+        ]
+    )
 
 
 def get_file_contents(file_path: str) -> str:
@@ -199,6 +241,7 @@ def post_final_review_comment(pr_number: int, comment: str) -> str:
 pr_details_tool = FunctionTool.from_defaults(get_pr_details)
 pr_commit_details_tool = FunctionTool.from_defaults(get_pr_commit_details)
 pr_changed_files_tool = FunctionTool.from_defaults(get_pr_changed_files)
+pr_review_context_tool = FunctionTool.from_defaults(get_pr_review_context)
 file_contents_tool = FunctionTool.from_defaults(get_file_contents)
 post_review_fn = post_final_review_comment
 review_comment_post_tool = FunctionTool.from_defaults(post_review_fn)
@@ -233,10 +276,7 @@ context_agent = FunctionAgent(
     ),
     system_prompt=CONTEXT_AGENT_PROMPT,
     tools=[
-        file_contents_tool,
-        pr_details_tool,
-        pr_changed_files_tool,
-        pr_commit_details_tool,
+        pr_review_context_tool,
         add_pr_details_to_state,
     ],
     can_handoff_to=["CommentorAgent"],
